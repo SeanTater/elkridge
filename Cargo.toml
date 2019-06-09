@@ -1,0 +1,7 @@
+[package]
+name = "squirrelfs"
+version = "0.1.0"
+authors = ["Sean Gallagher <stgallag@gmail.com>"]
+
+[dependencies]
+fuse = "^0.3.1"
