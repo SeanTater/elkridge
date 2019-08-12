@@ -1,2 +1,2 @@
-# squirrelfs
-SQLite based Fuse File System
+# Elkridge
+SQLite-backed archive filesystem
