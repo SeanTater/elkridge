@@ -13,7 +13,6 @@ use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, Reply
 use rusqlite as sql;
 
 mod errors;
-const UNIX_EPOCH_TIMESPEC: Timespec = Timespec { sec: 0, nsec: 0 };
 const TTL: Timespec = Timespec {sec: 1, nsec: 0};
 
 fn main() {
@@ -215,7 +214,7 @@ impl Filesystem for Elkridge {
     }
 
     /// Get the list of children in a directory
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, _offset: i64, mut reply: ReplyDirectory) {
         // Wrap so we can use ?
         let inner : sql::Result<()> = (|| {
             let mut stmt = self.conn.prepare(
