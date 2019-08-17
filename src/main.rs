@@ -11,8 +11,10 @@ use time::Timespec;
 use libc::ENOENT;
 use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
 use rusqlite as sql;
+use basic::BasicFilesystem;
 
 mod errors;
+mod basic;
 const TTL: Timespec = Timespec {sec: 1, nsec: 0};
 
 fn main() {
@@ -63,29 +65,27 @@ impl Elkridge {
             flags   INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS Path(
-            inode   INTEGER PRIMARY KEY NOT NULL REFERENCES Inode(inode) ON DELETE CASCADE ON UPDATE CASCADE,
+            inode   INTEGER NOT NULL UNIQUE REFERENCES Inode(inode) ON DELETE CASCADE ON UPDATE CASCADE,
             parent  INTEGER NOT NULL REFERENCES Inode(inode) ON DELETE RESTRICT ON UPDATE CASCADE,
-            name    TEXT NOT NULL CHECK ( length(name) > 0 )
+            name    TEXT NOT NULL CHECK ( length(name) > 0 ),
+            PRIMARY KEY (parent, name)
         );
-        CREATE INDEX IF NOT EXISTS Path__parent ON Path(parent);
         CREATE TABLE IF NOT EXISTS Page(
             inode   INTEGER NOT NULL REFERENCES Inode(inode) ON DELETE CASCADE ON UPDATE CASCADE,
-            start  INTEGER NOT NULL DEFAULT 0 CHECK (offset >= 0),
-            finish INTEGER NOT NULL DEFAULT 0 CHECK (offset >= 0),
+            start  INTEGER NOT NULL DEFAULT 0 CHECK (start >= 0),
+            finish INTEGER NOT NULL DEFAULT 0 CHECK (finish >= 0),
             content BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS Page__inode ON Page(inode);
         -- Create a root node
         INSERT OR IGNORE INTO Inode(inode, kind) VALUES (0, 3);
         -- Create a root path
-        INSERT OR IGNORE INTO Path(inode, parent, name, kind) VALUES (0, 0, '/');
+        INSERT OR IGNORE INTO Path(inode, parent, name) VALUES (0, 0, '');
         ")?;
         Ok(Elkridge{conn})
     }
 
-    /**
-     * Generate a file attribute for a table
-     */
+    /// Generate a file attribute for a table
     fn generate_fileattr_from_row(&self, row: &sql::Row) -> sql::Result<FileAttr> {
         Ok(FileAttr {
             // These three are fussy because technically we are straing an unsigned int as a signed int in sqlite
@@ -138,19 +138,8 @@ impl Elkridge {
 
 impl Filesystem for Elkridge {
     /// Search for an inode by parent and name (e.g. using the path)
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let search_result = self.conn.query_row(
-            "SELECT *,
-                (SELECT count(*) FROM Path WHERE Path.inode = Inode.inode) AS nlink
-            FROM Inode
-            WHERE parent = ? AND name = ?",
-            &[
-                &(parent as i64) as &sql::ToSql,
-                &name.to_str().unwrap_or("")
-            ],
-            |row| self.generate_fileattr_from_row(row)
-        );
-        match search_result {
+    fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        match self.lookup_basic(req, parent, name) {
             Ok(res) => reply.entry(&TTL, &res, 0),
             Err(e) => {
                 println!("Error: Failed to find {} {:?}.", name.to_str().unwrap_or("[Invalid name]"), e);
@@ -160,18 +149,8 @@ impl Filesystem for Elkridge {
     }
 
     /// Directly retrieve the info for an inode
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        let search_result = self.conn.query_row(
-            "SELECT *,
-                (SELECT count(*) FROM Path WHERE Path.inode = Inode.inode) AS nlink
-            FROM Inode
-            WHERE inode = ?",
-            &[
-                &(ino as i64) as &sql::ToSql,
-            ],
-            |row| self.generate_fileattr_from_row(row)
-        );
-        match search_result {
+    fn getattr(&mut self, req: &Request, ino: u64, reply: ReplyAttr) {
+        match self.getattr_basic(req, ino) {
             Ok(res) => reply.attr(&TTL, &res),
             Err(e) => {
                 println!("Error: Failed to find inode {} {:?}.", ino, e);
@@ -181,30 +160,8 @@ impl Filesystem for Elkridge {
     }
 
     /// Read some data from a page
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
-        // Wrap so we can use ?
-        let inner : sql::Result<Vec<u8>> = (|| {
-            let mut stmt = self.conn.prepare(
-                "SELECT content, offset_byte
-                FROM Page
-                WHERE inode = ?
-                    AND start <= ?
-                    AND finish >= ?
-                ORDER BY start")?;
-            let mut buf : Vec<u8> = Vec::with_capacity(size as usize * 4/3);
-            stmt.query_and_then(
-                &[
-                    &(ino as i64),
-                    &offset,
-                    &(offset + size as i64)
-                ],
-                // TODO: The type annotations here seem ugly
-                |row| Ok(buf.extend_from_slice(&row.get::<&str, Vec<u8>>("content")?)) as sql::Result<()>
-            )?;
-            Ok(buf)
-        })();
-        
-        match inner {
+    fn read(&mut self, req: &Request, ino: u64, fh: u64, offset: i64, size: u32, reply: ReplyData) {
+        match self.read_basic(req, ino, fh, offset, size) {
             Ok(buf) => reply.data(&buf),
             Err(e) => {
                 println!("Error: Performing read on ino:{} {:?}.", ino, e);
@@ -214,29 +171,14 @@ impl Filesystem for Elkridge {
     }
 
     /// Get the list of children in a directory
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, _offset: i64, mut reply: ReplyDirectory) {
-        // Wrap so we can use ?
-        let inner : sql::Result<()> = (|| {
-            let mut stmt = self.conn.prepare(
-                "SELECT inode, name, kind
-                FROM Path
-                NATURAL JOIN Inode
-                WHERE Path.parent = ?")?;
-            stmt.query_and_then(
-                &[ &(ino as i64) ],
-                // TODO: The type annotations here seem ugly
-                |row| Ok(reply.add(
-                    row.get::<&str, i64>("inode")? as u64,              // ino
-                    0,                                                  // offset
-                    Elkridge::filetype_from_code(row.get("inode")?),    // kind
-                    row.get::<&str, String>("name")?                                    // name
-                    )) as sql::Result<bool>
-            )?;
-            Ok(())
-        })();
-        
-        match inner {
-            Ok(_) => reply.ok(),
+    fn readdir(&mut self, req: &Request, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        match self.readdir_basic(req, ino, fh, offset) {
+            Ok(entries) => {
+                for entry in entries {
+                    reply.add(entry.ino, entry.offset, entry.kind, &entry.name);
+                }
+                reply.ok()
+            },
             Err(e) => {
                 println!("Error: Performing readdir on ino:{} {:?}.", ino, e);
                 reply.error(ENOENT);
