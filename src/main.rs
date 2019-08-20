@@ -9,7 +9,7 @@ use failure::Fallible;
 use std::ffi::OsStr;
 use time::Timespec;
 use libc::ENOENT;
-use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
+use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory, ReplyEmpty};
 use rusqlite as sql;
 use basic::BasicFilesystem;
 
@@ -181,6 +181,41 @@ impl Filesystem for Elkridge {
             },
             Err(e) => {
                 println!("Error: Performing readdir on ino:{} {:?}.", ino, e);
+                reply.error(ENOENT);
+            }
+        }
+    }
+
+    /// Create a directory
+    fn mkdir(
+        &mut self, 
+        req: &Request, 
+        parent: u64, 
+        name: &OsStr, 
+        mode: u32, 
+        reply: ReplyEntry
+    ) {
+        match self.mkdir_basic(req, parent, name, mode) {
+            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Err(e) => {
+                println!("Error: Performing mkdir on parent:{} name:{} {:?}.", parent, name.to_string_lossy(), e);
+                reply.error(ENOENT);
+            }
+        }
+    }
+
+    /// Remove a directory
+    fn rmdir(
+        &mut self, 
+        req: &Request, 
+        parent: u64, 
+        name: &OsStr, 
+        reply: ReplyEmpty
+    ) {
+        match self.rmdir_basic(req, parent, name) {
+            Ok(_) => reply.ok(),
+            Err(e) => {
+                println!("Error: Performing rmdir on parent:{} name:{} {:?}.", parent, name.to_string_lossy(), e);
                 reply.error(ENOENT);
             }
         }

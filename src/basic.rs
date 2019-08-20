@@ -4,11 +4,27 @@ use fuse::{FileType, FileAttr, Request};
 use rusqlite as sql;
 use std::ffi::{OsStr, OsString};
 
+/// Implementation of Filesystem, returning Fallible responses instead of using reply objects
+/// 
+/// The major advantage of this is just the use of Try.
 pub trait BasicFilesystem {
     fn lookup_basic(&mut self, req: &Request, parent: u64, name: &OsStr) -> Fallible<FileAttr>;
     fn getattr_basic(&mut self, req: &Request, ino: u64) -> Fallible<FileAttr>;
     fn read_basic(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, size: u32) -> Fallible<Vec<u8>>;
     fn readdir_basic(&mut self, req: &Request, ino: u64, _fh: u64, _offset: i64) -> Fallible<Vec<DirectoryEntry>>;
+    fn mkdir_basic(
+        &mut self, 
+        req: &Request, 
+        parent: u64, 
+        name: &OsStr, 
+        mode: u32
+    ) -> Fallible<FileAttr>;
+    fn rmdir_basic(
+        &mut self, 
+        req: &Request, 
+        parent: u64, 
+        name: &OsStr
+    ) -> Fallible<()>;
 }
 
 impl BasicFilesystem for Elkridge {
@@ -20,7 +36,7 @@ impl BasicFilesystem for Elkridge {
             FROM Inode
             WHERE parent = ? AND name = ?",
             &[
-                &(parent as i64) as &sql::ToSql,
+                &(parent as i64) as &dyn sql::ToSql,
                 &name.to_str().unwrap_or("")
             ],
             |row| self.generate_fileattr_from_row(row)
@@ -35,7 +51,7 @@ impl BasicFilesystem for Elkridge {
             FROM Inode
             WHERE inode = ?",
             &[
-                &(ino as i64) as &sql::ToSql,
+                &(ino as i64) as &dyn sql::ToSql,
             ],
             |row| self.generate_fileattr_from_row(row)
         )?)
@@ -83,6 +99,53 @@ impl BasicFilesystem for Elkridge {
             })
         )?.collect::<sql::Result<_>>()?;
         Ok(entries)
+    }
+    fn mkdir_basic(
+        &mut self, 
+        req: &Request, 
+        parent: u64, 
+        name: &OsStr, 
+        mode: u32
+    ) -> Fallible<FileAttr> {
+        let txn : sql::Transaction = self.conn.transaction()?;
+        let maybe_inode = txn.query_row(
+            "SELECT inode FROM Path
+                WHERE parent = ? AND name = ?; ",
+            &[ &(parent as i64) as &dyn sql::ToSql, &name.to_string_lossy() ],
+            |row| row.get::<&str, i64>("is_there"))
+            .ok();
+        let definitely_inode = match maybe_inode {
+            Some(ino) => ino,
+            None => {
+                txn.execute(
+                    "INSERT OR IGNORE INTO Inode(perm) VALUES (?);",
+                    &[mode])?;
+                let new_inode = txn.last_insert_rowid();
+                txn.execute(
+                    "INSERT OR IGNORE INTO Path(inode, parent, name) VALUES (?,?,?);",
+                    &[
+                        &new_inode,
+                        &(parent as i64) as &dyn sql::ToSql,
+                        &name.to_string_lossy()
+                    ])?;
+                new_inode
+            }
+        };
+        txn.commit()?;
+        self.getattr_basic(req, definitely_inode as u64)
+    }
+    fn rmdir_basic(
+        &mut self, 
+        _req: &Request, 
+        parent: u64, 
+        name: &OsStr
+    ) -> Fallible<()> {
+        self.conn.execute("DELETE FROM Path WHERE parent=? AND name = ?;",
+            &[
+                &(parent as i64) as &dyn sql::ToSql,
+                &name.to_string_lossy()
+            ])?;
+        Ok(())
     }
 }
 
